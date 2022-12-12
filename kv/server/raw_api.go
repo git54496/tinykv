@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"github.com/pingcap-incubator/tinykv/kv/storage/standalone_storage"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 )
 
@@ -9,8 +10,10 @@ import (
 // Some helper methods can be found in sever.go in the current directory
 
 // RawGet return the corresponding Get response based on RawGetRequest's CF and Key fields
-func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
+func (server *Server) RawGet(context context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	// Your Code Here (1).
+	s, ok = server.storage.(*standalone_storage.StandAloneStorage)
+	standalone_storage.NewStandaloneStorageReader(&server.storage.)
 	return nil, nil
 }
 
