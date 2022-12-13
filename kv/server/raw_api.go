@@ -22,16 +22,16 @@ func (server *Server) RawGet(context context.Context, req *kvrpcpb.RawGetRequest
 		return nil, err
 	}
 	value, err := reader.GetCF(req.GetCf(), req.GetKey())
+	if value == nil {
+		response.NotFound = true
+		return response, nil
+	}
 	if err != nil {
 		log.Fatal(err)
 		return nil, err
 	}
-	if value == nil {
-		response.NotFound = true
-	}
 
 	response.Value = value
-
 	return response, nil
 }
 
@@ -47,7 +47,7 @@ func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kv
 		Value: req.Value,
 		Cf: req.Cf,
 	}
-	var s []storage.Modify
+	var s  = make([]storage.Modify, 1)
 	s[0] = storage.Modify{
 		Data: mod,
 	}
@@ -73,7 +73,7 @@ func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest
 		Cf: req.Cf,
 	}
 
-	var s []storage.Modify
+	var s  = make([]storage.Modify, 1)
 	s[0] = storage.Modify{
 		Data: mod,
 	}
@@ -91,6 +91,11 @@ func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
 	// Your Code Here (1).
 	// Hint: Consider using reader.IterCF
+	resp := &kvrpcpb.RawScanResponse{
+		Kvs: make([]*kvrpcpb.KvPair,0),
+	}
+
+
 	reader, err := server.storage.Reader(req.Context)
 	defer reader.Close()
 	if err != nil {
@@ -100,12 +105,20 @@ func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*
 	iter := reader.IterCF(req.Cf)
 	defer iter.Close()
 
-	iter.Seek(req.StartKey)
+	for iter.Seek(req.StartKey); iter.Valid() && req.Limit > 0; req.Limit--  {
+		v, err := iter.Item().Value()
+		if err != nil {
+			log.Fatal(err.Error())
+			return nil, err
+		}
+		resp.Kvs = append(resp.Kvs, &kvrpcpb.KvPair{
+			Key: iter.Item().Key(),
+			Value: v,
+		})
+		iter.Next()
+	}
 
-
-
-
-	return nil, nil
+	return resp, nil
 }
 
 func modify(server *Server, context *kvrpcpb.Context, mods []storage.Modify) error  {

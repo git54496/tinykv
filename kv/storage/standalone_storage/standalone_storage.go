@@ -17,6 +17,7 @@ type StandAloneStorage struct {
 }
 
 func NewStandAloneStorage(conf *config.Config) *StandAloneStorage {
+	conf.Raft = false
 	storage := StandAloneStorage{
 		conf: conf,
 		db: nil,
@@ -28,11 +29,11 @@ func NewStandAloneStorage(conf *config.Config) *StandAloneStorage {
 func (s *StandAloneStorage) Start() error {
 	// Your Code Here (1).
 	opt := badger.DefaultOptions
-	opt.Dir = s.conf.StoreAddr
-	opt.ValueDir = s.conf.StoreAddr
+	opt.Dir = s.conf.DBPath
+	opt.ValueDir =  s.conf.DBPath
 	db, err := badger.Open(opt)
 	if err != nil {
-		log.Fatal("badger open error")
+		log.Fatal("Start()" + err.Error())
 		return err
 	}
 
@@ -94,6 +95,10 @@ type StandaloneStorageReader struct {
 
 func (reader *StandaloneStorageReader) GetCF(cf string, key []byte) ([]byte, error) {
 	value, err := engine_util.GetCFFromTxn(reader.txn, cf, key)
+	if err == badger.ErrKeyNotFound {
+		return nil, nil
+	}
+
 	if err != nil {
 		 return nil, err
 	}
