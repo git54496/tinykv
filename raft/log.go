@@ -28,35 +28,71 @@ type RaftLog struct {
 	// storage contains all stable entries since the last snapshot.
 	storage Storage
 
+	// 用在Storage中
 	// committed is the highest log position that is known to be in
 	// stable storage on a quorum of nodes.
 	committed uint64
 
+	// 用在Storage中
 	// applied is the highest log position that the application has
 	// been instructed to apply to its state machine.
 	// Invariant: applied <= committed
 	applied uint64
 
+	// 这个即：大于stabled的都是unstable的内容
 	// log entries with index <= stabled are persisted to storage.
 	// It is used to record the logs that are not persisted by storage yet.
 	// Everytime handling `Ready`, the unstabled logs will be included.
 	stabled uint64
 
+
+	// 这个是unstable的entries
 	// all entries that have not yet compact.
 	entries []pb.Entry
 
+	// 和Leader同步时传到stable上的snapshot数据
 	// the incoming unstable snapshot, if any.
 	// (Used in 2C)
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	firstIndex uint64
+
+}
+
+func (l *RaftLog) appendEntries(entries ...pb.Entry) {
+	l.entries = append(l.entries, entries...)
 }
 
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	hardState, _, err := storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
+
+	firstIndex, _ := storage.FirstIndex()
+	lastIndex, _ := storage.LastIndex()
+
+	entries := make([]pb.Entry, 0)
+	// todo: 为啥要从storage中读取？
+	//if firstIndex <= lastIndex {
+	//	entries, err = storage.Entries(firstIndex, lastIndex+1)
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//}
+
+	return &RaftLog{
+		storage:    storage,
+		committed:  hardState.Commit,
+		applied:    firstIndex - 1,
+		stabled:    lastIndex,
+		firstIndex: firstIndex,
+		entries:    entries,
+	}
 }
 
 // We need to compact the log entries in some point of time like
@@ -89,11 +125,35 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return 0
+	if len(l.entries) > 0 {
+		// todo: 为啥index的值是来自Entry自带的？
+		// INDEX表示的是一个全局唯一的标识
+		return l.entries[len(l.entries)-1].Index
+	}
+	index, _ := l.storage.LastIndex()
+	if !IsEmptySnap(l.pendingSnapshot) {
+		index = max(index, l.pendingSnapshot.Metadata.Index)
+	}
+	return index
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
+	if len(l.entries) > 0 && i >= l.firstIndex {
+		if i > l.LastIndex() {
+			return 0, ErrUnavailable
+		}
+		return l.entries[i-l.firstIndex].Term, nil
+	}
+	term, err := l.storage.Term(i)
+	if err == ErrUnavailable && !IsEmptySnap(l.pendingSnapshot) {
+		if i == l.pendingSnapshot.Metadata.Index {
+			return l.pendingSnapshot.Metadata.Term, nil
+		}
+		if i < l.pendingSnapshot.Metadata.Index {
+			return term, ErrCompacted
+		}
+	}
 	return 0, nil
 }

@@ -16,8 +16,10 @@ package raft
 
 import (
 	"errors"
+	"math/rand"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"github.com/pingcap-incubator/tinykv/log"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -104,6 +106,7 @@ func (c *Config) validate() error {
 // Progress represents a follower’s progress in the view of the leader. Leader maintains
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
+	// Match表示当前同步的值，Next表示接下俩想要的值
 	Match, Next uint64
 }
 
@@ -124,8 +127,12 @@ type Raft struct {
 
 	// votes records
 	votes map[uint64]bool
+	// 用来表示其他节点对本节点MsgVote的回应，超过半数即成功当选or失败
+	Agreed   int
+	Rejected int
 
 	// msgs need to send
+	// 因为暂时不涉及web调用，且testing中只有一个节点的情况，所以往其他节点发送的消息，可以直接放在这个slice中
 	msgs []pb.Message
 
 	// the leader id
@@ -135,6 +142,8 @@ type Raft struct {
 	heartbeatTimeout int
 	// baseline of election interval
 	electionTimeout int
+	realElectionTimeout int
+
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
 	heartbeatElapsed int
@@ -161,18 +170,95 @@ type Raft struct {
 
 // newRaft return a raft peer with the given config
 func newRaft(c *Config) *Raft {
+	// Your Code Here (2A).
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
-	// Your Code Here (2A).
-	return nil
+	// 得从storage中读取初始配置
+	hardState, confState, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// 能从config中读取的就从config中读取
+	raft := &Raft{
+		id:               c.ID,
+		Term:             hardState.Term,
+		Vote:             hardState.Vote,
+		RaftLog:          newLog(c.Storage),
+		Prs:              make(map[uint64]*Progress),
+		State:            StateFollower,
+		votes:            make(map[uint64]bool),
+		Rejected:         0,
+		Lead:             None,
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+	}
+	if hardState.Vote == c.ID {
+		raft.Agreed = 1
+	}
+	if c.peers == nil {
+		c.peers = confState.Nodes
+	}
+
+	for _, p := range c.peers {
+		raft.Prs[p] = &Progress{
+			Match: 0,
+			Next:  0,
+		}
+	}
+	raft.resetElectionTimeout()
+	return raft
 }
 
+
+func (r *Raft) resetElectionTimeout() {
+	r.realElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+}
+
+// 发送MsgApp
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	lastIndex := r.RaftLog.LastIndex()
+	preLogIndex := r.Prs[to].Next - 1
+
+	preLogTerm, err := r.RaftLog.Term(preLogIndex)
+	if err != nil {
+		if err == ErrCompacted {
+			r.sendSnapshot(to)
+			return true
+		}
+		return false
+	}
+	entries := r.RaftLog.Entries(r.Prs[to].Next, lastIndex+1)
+
+	sendEntries := make([]*pb.Entry, 0, len(entries))
+	for _, e := range entries {
+		sendEntries = append(sendEntries, &pb.Entry{
+			EntryType: pb.EntryType_EntryNormal,
+			Term:      e.Term,
+			Index:     e.Index,
+			Data:      e.Data,
+		})
+	}
+	//if len(sendEntries) > 0 {
+	//log.Infof("%d send index [%d %d] to %d\n", r.Id, sendEntries[0].Index, sendEntries[len(sendEntries)-1].Index, to)
+	//}
+
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		To:      to,
+		From:    r.Id,
+		Term:    r.Term,
+		LogTerm: preLogTerm,
+		Index:   preLogIndex,
+		Entries: sendEntries,
+		Commit:  r.RaftLog.committed,
+	}
+	r.msgs = append(r.msgs, msg)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -188,17 +274,94 @@ func (r *Raft) tick() {
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	log.Infof("%d become follower, term: %d, lastIndex: %d\n", r.id, r.Term, r.RaftLog.LastIndex())
+	r.Term = term
+	r.Lead = lead
+	r.State = StateFollower
+	r.votes = nil
+	r.Agreed = 0
+	r.Rejected = 0
+	r.resetTick()
 }
 
+// 候选人term++
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	r.Term ++
+	r.State = StateCandidate
+	r.Vote = r.id
+
+	r.votes = make(map[uint64]bool)
+	r.Agreed = 1
+	r.Rejected = 0
+	r.votes[r.id] = true
+	r.resetTick()
+
+	log.Infof("%d become candidate, term: %d, lastIndex: %d\n", r.id, r.Term, r.RaftLog.LastIndex())
+	//fmt.Printf("%d become candidate\n", r.Id)
+	if r.Agreed > len(r.Prs)/2 {
+		r.becomeLeader()
+	}
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	log.Infof("%d become leader, Term: %d, lastIndex: %d\n", r.Id, r.Term, r.RaftLog.LastIndex())
+	r.State = StateLeader
+
+	// todo: 这里的日志这样子设置是对的吗？
+	for _, v := range r.Prs {
+		// 初始化，一开始Leader不知道follower和自己日志匹配的最大index
+		v.Match = 0
+		// unstable的第一个entry即为下一个要发送的entry位置
+		v.Next = r.RaftLog.LastIndex() + 1
+	}
+
+	r.resetTick()
+	// immediately append a noop entry
+	r.appendEntries(&pb.Entry{
+		EntryType: pb.EntryType_EntryNormal,
+		Term:      r.Term,
+		Index:     r.RaftLog.LastIndex() + 1,
+		Data:      nil,
+	})
+	r.bCastAppend()
+	// for only one node
+	r.advanceCommitIndex()
+}
+
+func (r *Raft) bCastAppend() {
+	for peer := range r.Prs {
+		if peer != r.id {
+			r.sendAppend(peer)
+		}
+	}
+}
+
+func (r *Raft) appendEntries(entries ...*pb.Entry) {
+	es := make([]pb.Entry, 0, len(entries))
+	for _, e := range entries {
+		es = append(es, pb.Entry{
+			EntryType: e.EntryType,
+			Term:      e.Term,
+			Index:     e.Index,
+			Data:      e.Data,
+		})
+	}
+
+	// 往unstable中添加entries
+	r.RaftLog.appendEntries(es...)
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+}
+
+func (r *Raft) resetTick() {
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.resetElectionTimeout()
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -207,6 +370,10 @@ func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	switch r.State {
 	case StateFollower:
+		switch m.MsgType {
+			case pb.MessageType_MsgAppend:
+
+		}
 	case StateCandidate:
 	case StateLeader:
 	}
