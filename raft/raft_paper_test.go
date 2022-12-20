@@ -892,7 +892,7 @@ func commitNoopEntry(r *Raft, s *MemoryStorage) {
 		panic("it should only be used when it is the leader")
 	}
 	for id := range r.Prs {
-		if id == r.Id {
+		if id == r.id {
 			continue
 		}
 

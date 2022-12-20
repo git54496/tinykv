@@ -46,7 +46,7 @@ type RaftLog struct {
 	stabled uint64
 
 
-	// 这个是unstable的entries
+	// todo: 这个是unstable的entries，初始化的时候来自于Storage中，不知道是不是代表unstable
 	// all entries that have not yet compact.
 	entries []pb.Entry
 
@@ -77,13 +77,14 @@ func newLog(storage Storage) *RaftLog {
 	lastIndex, _ := storage.LastIndex()
 
 	entries := make([]pb.Entry, 0)
-	// todo: 为啥要从storage中读取？
-	//if firstIndex <= lastIndex {
-	//	entries, err = storage.Entries(firstIndex, lastIndex+1)
-	//	if err != nil {
-	//		panic(err)
-	//	}
-	//}
+	// 如果MemStorage中没有entries，firstIndex会等于lastIndex
+	// 这里就是把storage中的entries提取出来
+	if firstIndex <= lastIndex {
+		entries, err = storage.Entries(firstIndex, lastIndex+1)
+		if err != nil {
+			panic(err)
+		}
+	}
 
 	return &RaftLog{
 		storage:    storage,
@@ -119,6 +120,9 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
+	if len(l.entries) > 0 {
+		return l.entries[l.stabled-l.firstIndex+1:]
+	}
 	return nil
 }
 
@@ -126,14 +130,13 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if len(l.entries) > 0 {
-		// todo: 为啥index的值是来自Entry自带的？
 		// INDEX表示的是一个全局唯一的标识
 		return l.entries[len(l.entries)-1].Index
 	}
 	index, _ := l.storage.LastIndex()
-	if !IsEmptySnap(l.pendingSnapshot) {
-		index = max(index, l.pendingSnapshot.Metadata.Index)
-	}
+	//if !IsEmptySnap(l.pendingSnapshot) {
+	//	index = max(index, l.pendingSnapshot.Metadata.Index)
+	//}
 	return index
 }
 
@@ -146,14 +149,25 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		}
 		return l.entries[i-l.firstIndex].Term, nil
 	}
-	term, err := l.storage.Term(i)
-	if err == ErrUnavailable && !IsEmptySnap(l.pendingSnapshot) {
-		if i == l.pendingSnapshot.Metadata.Index {
-			return l.pendingSnapshot.Metadata.Term, nil
-		}
-		if i < l.pendingSnapshot.Metadata.Index {
-			return term, ErrCompacted
-		}
-	}
+	// todo: 这里涉及到了storage，先不管
+	//term, err := l.storage.Term(i)
+	//if err == ErrUnavailable && !IsEmptySnap(l.pendingSnapshot) {
+	//	if i == l.pendingSnapshot.Metadata.Index {
+	//		return l.pendingSnapshot.Metadata.Term, nil
+	//	}
+	//	if i < l.pendingSnapshot.Metadata.Index {
+	//		return term, ErrCompacted
+	//	}
+	//}
 	return 0, nil
+}
+
+
+// Entries returns entries in [lo, hi)
+func (l *RaftLog) Entries(lo, hi uint64) []pb.Entry {
+	if lo >= l.firstIndex && hi-l.firstIndex <= uint64(len(l.entries)) {
+		return l.entries[lo-l.firstIndex : hi-l.firstIndex]
+	}
+	ents, _ := l.storage.Entries(lo, hi)
+	return ents
 }
