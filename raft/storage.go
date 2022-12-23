@@ -148,7 +148,13 @@ func (ms *MemoryStorage) LastIndex() (uint64, error) {
 }
 
 func (ms *MemoryStorage) lastIndex() uint64 {
-	return ms.ents[0].Index + uint64(len(ms.ents)) - 1
+	// 原来这么写的意义在哪里？？？？？？不就是取最后一个Entry的Index值吗？这样子还有可能出错，万一中间有Index被跳过了
+	//v1 := ms.ents[0].Index + uint64(len(ms.ents)) - 1
+	v2 := ms.ents[len(ms.ents)-1].Index
+	//fmt.Printf("v1:  %d \n", v1)
+	//fmt.Printf("v2:  %d \n", v2)
+	return v2
+	//return ms.ents[len(ms.ents)-1].Index
 }
 
 // FirstIndex implements the Storage interface.

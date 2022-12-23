@@ -14,7 +14,9 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -101,6 +103,16 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	if len(l.entries) < 0 {
+		return
+	}
+	newFirstIndex, _ := l.storage.FirstIndex()
+	if newFirstIndex > l.firstIndex {
+		entries := l.entries[newFirstIndex-l.firstIndex:]
+		l.entries = make([]pb.Entry, len(entries))
+		copy(l.entries, entries)
+		l.firstIndex = newFirstIndex
+	}
 }
 
 // allEntries return all the entries not compacted.
@@ -108,12 +120,17 @@ func (l *RaftLog) maybeCompact() {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	return l.entries
 }
+
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
+	//return nil
+	if len(l.entries) > 0 {
+		return l.entries[l.stabled-l.firstIndex+1:]
+	}
 	return nil
 }
 
@@ -121,7 +138,13 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	if len(l.entries) > 0 {
-		return l.entries[l.stabled-l.firstIndex+1:]
+		// v1 := l.entries[l.stabled-l.firstIndex+1:]
+		// fmt.Print(v1)
+		//// return
+		//V2 := l.entries[l.applied-l.firstIndex+1 : l.committed-l.firstIndex+1]
+		//fmt.Print(V2)
+
+		return l.entries[l.applied-l.firstIndex+1 : l.committed-l.firstIndex+1]
 	}
 	return nil
 }
@@ -140,6 +163,15 @@ func (l *RaftLog) LastIndex() uint64 {
 	return index
 }
 
+func (l *RaftLog) FirstIndex() uint64 {
+	// Your Code Here (2A).
+	if len(l.entries) == 0 {
+		i, _ := l.storage.FirstIndex()
+		return i - 1
+	}
+	return l.entries[0].Index
+}
+
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
@@ -150,15 +182,15 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return l.entries[i-l.firstIndex].Term, nil
 	}
 	// todo: 这里涉及到了storage，先不管
-	//term, err := l.storage.Term(i)
-	//if err == ErrUnavailable && !IsEmptySnap(l.pendingSnapshot) {
-	//	if i == l.pendingSnapshot.Metadata.Index {
-	//		return l.pendingSnapshot.Metadata.Term, nil
-	//	}
-	//	if i < l.pendingSnapshot.Metadata.Index {
-	//		return term, ErrCompacted
-	//	}
-	//}
+	term, err := l.storage.Term(i)
+	if err == ErrUnavailable && !IsEmptySnap(l.pendingSnapshot) {
+		if i == l.pendingSnapshot.Metadata.Index {
+			return l.pendingSnapshot.Metadata.Term, nil
+		}
+		if i < l.pendingSnapshot.Metadata.Index {
+			return term, ErrCompacted
+		}
+	}
 	return 0, nil
 }
 
@@ -171,3 +203,4 @@ func (l *RaftLog) Entries(lo, hi uint64) []pb.Entry {
 	ents, _ := l.storage.Entries(lo, hi)
 	return ents
 }
+

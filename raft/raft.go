@@ -175,13 +175,10 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
-	// 得从storage中读取初始配置
 	hardState, confState, err := c.Storage.InitialState()
 	if err != nil {
 		panic(err.Error())
 	}
-
-	// 能从config中读取的就从config中读取
 	raft := &Raft{
 		id:               c.ID,
 		Term:             hardState.Term,
@@ -212,12 +209,11 @@ func newRaft(c *Config) *Raft {
 	return raft
 }
 
-
 func (r *Raft) resetElectionTimeout() {
 	r.realElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 }
 
-// 发送MsgApp
+// 发送MsgApp。是把Progress中next到当前节点上raftlog的lastindex之间的所有entries都发出去了
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
@@ -233,9 +229,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 		}
 		return false
 	}
+
+	// 这里传输的是
 	entries := r.RaftLog.Entries(r.Prs[to].Next, lastIndex+1)
-
-
 
 	sendEntries := make([]*pb.Entry, 0, len(entries))
 	for _, e := range entries {
@@ -255,8 +251,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
-		LogTerm: preLogTerm,
-		Index:   preLogIndex,
+		LogTerm: preLogTerm,  // 指的是发送的entries的term
+		Index:   preLogIndex,  // 指的是发送的entries的index
 		Entries: sendEntries,
 		Commit:  r.RaftLog.committed,
 	}
@@ -408,15 +404,16 @@ func (r *Raft) becomeLeader() {
 	log.Infof("%d become leader, Term: %d, lastIndex: %d\n", r.id, r.Term, r.RaftLog.LastIndex())
 	r.State = StateLeader
 
-	// todo: 这里的日志这样子设置是对的吗？
 	for _, v := range r.Prs {
 		// 初始化，一开始Leader不知道follower和自己日志匹配的最大index
 		v.Match = 0
-		// unstable的第一个entry即为下一个要发送的entry位置
+		// unstable的第一个entry即为当前Leader下一个要发送的entry位置
 		v.Next = r.RaftLog.LastIndex() + 1
 	}
 
 	r.resetTick()
+
+
 	// immediately append a noop entry
 	r.appendEntries(&pb.Entry{
 		EntryType: pb.EntryType_EntryNormal,
@@ -424,9 +421,10 @@ func (r *Raft) becomeLeader() {
 		Index:     r.RaftLog.LastIndex() + 1,
 		Data:      nil,
 	})
+	// 群发当上Leader之后的第一条空消息
 	r.bCastAppend()
-	// for only one node
-	//r.advanceCommitIndex()
+	// 上面我们初始化了follower节点的match和next数据，接下来我们需要明确当前Leader节点上的committed数据（即根据follower节点的match来计算）
+	r.advanceCommitIndex()
 }
 
 func (r *Raft) bCastAppend() {
@@ -437,6 +435,7 @@ func (r *Raft) bCastAppend() {
 	}
 }
 
+// 应该是收到超过半数的follower的接收请求之后，这里commit++
 func (r *Raft) advanceCommitIndex() {
 	// If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term
@@ -510,10 +509,14 @@ func (r *Raft) stepCandidate(m pb.Message) {
 		r.campaign()
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgRequestVote:
+		r.handleVote(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.handleVoteResp(m)
+	case pb.MessageType_MsgAppendResponse:
+		r.handleAppendResp(m)
 	}
 }
 
@@ -543,16 +546,69 @@ func (r *Raft) handleVoteResp(m pb.Message) {
 
 func (r *Raft) stepLeader(m pb.Message) {
 	switch m.MsgType {
-	case pb.MessageType_MsgHup:
-		r.campaign()
 	case pb.MessageType_MsgPropose:
-
+		// because the test entries' term and index are not set
+		lastIndex := r.RaftLog.LastIndex()
+		entities := make([]*pb.Entry, 0, len(m.Entries))
+		for _, e := range m.Entries {
+			entities = append(entities, &pb.Entry{
+				EntryType: e.EntryType,
+				Term:      r.Term,
+				Index:     lastIndex + 1,
+				Data:      e.Data,
+			})
+			lastIndex += 1
+		}
+		r.appendEntries(entities...)
+		r.bCastAppend()
+		// if only on node in raft cluster
+		r.advanceCommitIndex()
+	case pb.MessageType_MsgRequestVote:
+		r.handleVote(m)
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgBeat:
+		r.bCastHeartbeat()
+	case pb.MessageType_MsgHeartbeatResponse:
+		r.handleHeartbeatResp(m)
+	case pb.MessageType_MsgAppendResponse:
+		r.handleAppendResp(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
 	}
 }
+
+
+func (r *Raft) handleHeartbeatResp(m pb.Message) {
+	// r is the old leader, send heartbeat to m.From
+	// but m.From is the new Leader
+	if m.Term > r.Term {
+		r.becomeFollower(m.Term, m.From)
+		return
+	}
+	// because we don't have append timeout
+	// so append here
+	r.bCastAppend()
+}
+
+
+func (r *Raft) handleAppendResp(m pb.Message) {
+	if m.Term > r.Term {
+		r.becomeFollower(m.Term, m.From)
+		return
+	}
+	if !m.Reject {
+		//fmt.Println("append success, index is ", m.Index)
+		r.Prs[m.From].Match = m.Index
+		r.Prs[m.From].Next = m.Index + 1
+	} else {
+		r.Prs[m.From].Next -= 1
+		r.sendAppend(m.From)
+	}
+	r.advanceCommitIndex()
+}
+
+
 
 func (r *Raft) stepFollower(m pb.Message) {
 	switch m.MsgType {
@@ -641,19 +697,58 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		r.sendAppendResp(m.From, true, 0)
 		return
 	}
-
 	r.becomeFollower(m.Term, m.From)
 
-
 	// check prevLogIndex and prevLogTerm
-	//term, err := r.RaftLog.Term(m.Index)
-	//
-	////if err != nil || term != m.LogTerm {
-	////	r.sendAppendResp(m.From, true, 0)
-	////	return
-	////}
-	//r.sendAppendResp(m.From, false, lastNewEntryIndex)
+	term, err := r.RaftLog.Term(m.Index)
+	if err != nil || term != m.LogTerm {
+		r.sendAppendResp(m.From, true, 0)
+		return
+	}
 
+	if len(m.Entries) > 0 {
+		lastIndex := r.RaftLog.LastIndex()
+		// get where the log last matched
+		matched := -1
+		for i, e := range m.Entries {
+			// all the entries that in r.RaftLog matches
+			if e.Index > lastIndex {
+				break
+			}
+			term := mustTerm(r.RaftLog.Term(e.Index))
+			if term != e.Term {
+				// from e.Index, the log do not match
+				r.RaftLog.removeEntriesFrom(e.Index)
+				break
+			}
+			matched = i
+		}
+		// not all matched
+		if matched < len(m.Entries)-1 {
+			r.appendEntries(m.Entries[matched+1:]...)
+		}
+	}
+
+	// If leaderCommit > commitIndex, set commitIndex
+	// min(leaderCommit, index of last new entry)
+	lastNewEntryIndex := m.Index + uint64(len(m.Entries))
+	if m.Commit > r.RaftLog.committed {
+		r.RaftLog.committed = min(m.Commit, lastNewEntryIndex)
+	}
+
+	r.sendAppendResp(m.From, false, lastNewEntryIndex)
+
+}
+
+
+
+func (l *RaftLog) removeEntriesFrom(index uint64) {
+	// maybe remove stabled entries
+	l.stabled = min(index-1, l.stabled)
+	if index-l.firstIndex >= uint64(len(l.entries)) {
+		return
+	}
+	l.entries = l.entries[:index-l.firstIndex]
 }
 
 
@@ -672,7 +767,27 @@ func (r *Raft) sendAppendResp(to uint64, reject bool, matched uint64) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	if m.Term < r.Term {
+		r.sendHeartbeatResp(m.From, true)
+		return
+	}
+	// only leader can send heartbeat
+	// if network partition, the old leader's term will less than r.Term, which would be rejected before this
+	// so, it's safe to becomeFollower
+	r.becomeFollower(m.Term, m.From)
+	r.sendHeartbeatResp(m.From, false)
+}
 
+func (r *Raft) sendHeartbeatResp(to uint64, reject bool) {
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeatResponse,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Index:   r.RaftLog.LastIndex(),
+		Reject:  reject,
+	}
+	r.msgs = append(r.msgs, msg)
 }
 
 // handleSnapshot handle Snapshot RPC request
